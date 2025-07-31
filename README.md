@@ -18,7 +18,7 @@ This tool gets around the limitation by automating the browser itself to retriev
 I haven't tested this tool on any browsers other than Brave. If you find any errors regarding paths or cookie extraction, feel free to open an issue.
 
 ---
-## Browsers Working On
+## Browsers Working On That Have Been Tested
 
 ### Chromium-based Browsers
 - ✅ **Brave**
